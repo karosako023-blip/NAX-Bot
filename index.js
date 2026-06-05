@@ -9,75 +9,96 @@ const {
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
-  PermissionsBitField
+  PermissionsBitField,
+  SlashCommandBuilder,
+  REST,
+  Routes
 } = require("discord.js");
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
-  ],
-  partials: [Partials.Channel]
-});
+const TOKEN = process.env.TOKEN;
 
 // ===== CONFIG =====
 const STAFF_ROLE = "1512551951122825356";
 const NAX_ROLE = "1512551876854415441";
 const LOG_CHANNEL = "1512564461377163385";
-const PANEL_CHANNEL = "1512543946700488876";
 const CATEGORY = "1511784868856467487";
 
-const COLOR = 0x87CEFA; // light blue
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel]
+});
 
-const activeTickets = new Map();
+// store tickets properly (FIXES YOUR BUG)
+const tickets = new Map(); // userId -> channelId
+const claims = new Map();  // channelId -> staffId
 
-// ===== READY =====
-client.once("ready", () => {
+// ===== SLASH COMMANDS =====
+const commands = [
+  new SlashCommandBuilder()
+    .setName("panel")
+    .setDescription("Send ticket panel")
+].map(c => c.toJSON());
+
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  await rest.put(
+    Routes.applicationCommands(client.user.id),
+    { body: commands }
+  );
+
+  console.log("Slash commands loaded");
 });
 
 // ===== PANEL =====
-client.on("messageCreate", async (message) => {
-  if (message.content !== "!panel") return;
+client.on("interactionCreate", async (i) => {
+  if (!i.isChatInputCommand()) return;
 
-  const embed = new EmbedBuilder()
-    .setTitle("NAX Ticket System")
-    .setColor(COLOR)
-    .setDescription("Choose an option below");
+  if (i.commandName === "panel") {
+    const embed = new EmbedBuilder()
+      .setTitle("🔥 NAX TICKETS")
+      .setColor(0x87CEFA)
+      .setDescription("Choose an option below to open a ticket");
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("support")
-      .setLabel("Support Ticket")
-      .setStyle(ButtonStyle.Primary),
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("support")
+        .setLabel("Support Ticket")
+        .setStyle(ButtonStyle.Primary),
 
-    new ButtonBuilder()
-      .setCustomId("tryout")
-      .setLabel("Tryout Ticket")
-      .setStyle(ButtonStyle.Success)
-  );
+      new ButtonBuilder()
+        .setCustomId("tryout")
+        .setLabel("Tryout Ticket")
+        .setStyle(ButtonStyle.Success)
+    );
 
-  message.channel.send({ embeds: [embed], components: [row] });
+    return i.reply({ embeds: [embed], components: [row] });
+  }
 });
 
-// ===== INTERACTIONS =====
+// ===== BUTTONS =====
 client.on("interactionCreate", async (i) => {
   if (!i.isButton()) return;
 
   const guild = i.guild;
 
-  // ONE TICKET PER USER
-  if ([...activeTickets.values()].find(t => t.user === i.user.id)) {
-    return i.reply({ content: "You already have a ticket.", ephemeral: true });
+  // FIXED: proper ticket check
+  if (tickets.has(i.user.id)) {
+    return i.reply({ content: "❌ You already have an open ticket.", ephemeral: true });
   }
 
   // ===== CREATE TICKET =====
   if (i.customId === "support" || i.customId === "tryout") {
 
     const channel = await guild.channels.create({
-      name: `ticket-${i.user.username}`,
+      name: `${i.customId}-${i.user.username}`,
       type: ChannelType.GuildText,
       parent: CATEGORY,
       permissionOverwrites: [
@@ -87,86 +108,114 @@ client.on("interactionCreate", async (i) => {
         },
         {
           id: i.user.id,
-          allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.AttachFiles
+          ]
         },
         {
           id: STAFF_ROLE,
-          allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages]
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages
+          ]
         }
       ]
     });
 
-    activeTickets.set(channel.id, {
-      user: i.user.id,
-      type: i.customId
-    });
+    tickets.set(i.user.id, channel.id);
 
     const embed = new EmbedBuilder()
-      .setColor(COLOR)
-      .setTitle("Ticket Opened")
+      .setTitle("🎫 Ticket Created")
+      .setColor(0x87CEFA)
       .setDescription(
         i.customId === "tryout"
-          ? "Send your **Roblox username** first, then upload your **Rivals stats screenshot**."
-          : "Explain your issue and staff will help you."
+          ? "Send your **Roblox username**, then upload your **Rivals stats screenshot**."
+          : "Explain your issue clearly and staff will assist you."
       );
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId("close")
-        .setLabel("Close")
-        .setStyle(ButtonStyle.Danger),
-
-      new ButtonBuilder()
         .setCustomId("claim")
         .setLabel("Claim")
-        .setStyle(ButtonStyle.Secondary)
+        .setStyle(ButtonStyle.Secondary),
+
+      new ButtonBuilder()
+        .setCustomId("close")
+        .setLabel("Close")
+        .setStyle(ButtonStyle.Danger)
     );
 
-    await channel.send({ content: `<@&${STAFF_ROLE}>`, embeds: [embed], components: [row] });
+    await channel.send({
+      content: `<@&${STAFF_ROLE}>`,
+      embeds: [embed],
+      components: [row]
+    });
 
-    return i.reply({ content: `Ticket created: ${channel}`, ephemeral: true });
+    return i.reply({ content: `✅ Ticket created: ${channel}`, ephemeral: true });
   }
 
-  // ===== CLOSE =====
-  if (i.customId === "close") {
-    const ch = i.channel;
-    await ch.send("Ticket closing...");
-    setTimeout(() => ch.delete(), 2000);
-  }
-
-  // ===== CLAIM =====
+  // ===== CLAIM FIXED =====
   if (i.customId === "claim") {
-    i.channel.send(`Ticket claimed by <@${i.user.id}>`);
+    claims.set(i.channel.id, i.user.id);
+    return i.reply(`📌 Ticket claimed by <@${i.user.id}>`);
   }
 
-  // ===== ACCEPT / REJECT (manual staff commands later) =====
+  // ===== CLOSE + TRANSCRIPT =====
+  if (i.customId === "close") {
+    const channel = i.channel;
+
+    const messages = await channel.messages.fetch({ limit: 50 });
+
+    let logText = messages
+      .map(m => `${m.author.tag}: ${m.content}`)
+      .reverse()
+      .join("\n");
+
+    const logChannel = guild.channels.cache.get(LOG_CHANNEL);
+
+    if (logChannel) {
+      logChannel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("📄 Ticket Closed")
+            .setColor(0x87CEFA)
+            .setDescription(`\`\`\`${logText.slice(0, 3000)}\`\`\``)
+        ]
+      });
+    }
+
+    tickets.delete(i.channel.topic);
+
+    await i.reply("🔒 Closing ticket...");
+    setTimeout(() => channel.delete(), 2000);
+  }
 });
 
-// ===== SIMPLE MODERATION =====
+// ===== MODERATION =====
 client.on("messageCreate", async (m) => {
   if (!m.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
 
   if (m.content.startsWith("!kick")) {
-    const user = m.mentions.members.first();
-    if (user) user.kick();
+    const u = m.mentions.members.first();
+    if (u) u.kick();
   }
 
   if (m.content.startsWith("!ban")) {
-    const user = m.mentions.members.first();
-    if (user) user.ban();
+    const u = m.mentions.members.first();
+    if (u) u.ban();
   }
 
   if (m.content.startsWith("!purge")) {
-    const amount = parseInt(m.content.split(" ")[1]);
-    if (!amount) return;
-    m.channel.bulkDelete(amount);
+    const amt = parseInt(m.content.split(" ")[1]);
+    if (amt) m.channel.bulkDelete(amt);
   }
 
   if (m.content.startsWith("!timeout")) {
-    const user = m.mentions.members.first();
-    if (!user) return;
-    user.timeout(10 * 60 * 1000);
+    const u = m.mentions.members.first();
+    if (u) u.timeout(10 * 60 * 1000);
   }
 });
 
-client.login(process.env.TOKEN);
+client.login(TOKEN);
