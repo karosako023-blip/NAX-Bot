@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const fs = require("fs");
 const {
   Client,
   GatewayIntentBits,
@@ -15,9 +16,6 @@ const {
   Routes,
   StringSelectMenuBuilder
 } = require("discord.js");
-
-const Database = require("better-sqlite3");
-const ms = require("ms");
 
 // ===== CONFIG =====
 const TOKEN = process.env.TOKEN;
@@ -40,38 +38,27 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ===== DB =====
-const db = new Database("nax.db");
+// ===== SIMPLE JSON DB =====
+const DB_FILE = "./database.json";
 
-db.prepare(`
-CREATE TABLE IF NOT EXISTS tickets (
-  userId TEXT PRIMARY KEY,
-  channelId TEXT,
-  type TEXT,
-  data TEXT
-)
-`).run();
+function loadDB() {
+  return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+}
 
-// ===== STATE =====
+function saveDB(db) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// ===== STATE MEMORY =====
 const flow = new Map();
 const claimed = new Map();
 
 // cleanup stuck flows
 setInterval(() => {
-  for (const [id, v] of flow.entries()) {
-    if (!v || !v.step) flow.delete(id);
+  for (const [k, v] of flow.entries()) {
+    if (!v || !v.step) flow.delete(k);
   }
 }, 600000);
-
-// ===== DB HELPERS =====
-function saveTicket(userId, channelId, type, data = {}) {
-  db.prepare(`INSERT OR REPLACE INTO tickets VALUES (?, ?, ?, ?)`)
-    .run(userId, channelId, type, JSON.stringify(data));
-}
-
-function getTicket(userId) {
-  return db.prepare(`SELECT * FROM tickets WHERE userId = ?`).get(userId);
-}
 
 // ===== SLASH COMMANDS =====
 const commands = [
@@ -91,7 +78,7 @@ client.once("ready", async () => {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
 
-  console.log("Slash commands loaded");
+  console.log("Bot ready");
 });
 
 // ===== PANEL =====
@@ -106,7 +93,6 @@ client.on("interactionCreate", async (i) => {
 
     const menu = new StringSelectMenuBuilder()
       .setCustomId("ticket_select")
-      .setPlaceholder("Choose option")
       .addOptions(
         { label: "Support Ticket", value: "support" },
         { label: "Tryout Ticket", value: "tryout" }
@@ -129,7 +115,9 @@ client.on("interactionCreate", async (i) => {
   if (!i.isStringSelectMenu()) return;
   if (i.customId !== "ticket_select") return;
 
-  if (getTicket(i.user.id)) {
+  const db = loadDB();
+
+  if (Object.values(db).find(t => t.userId === i.user.id)) {
     return i.reply({ content: "❌ You already have a ticket.", ephemeral: true });
   }
 
@@ -159,22 +147,23 @@ client.on("interactionCreate", async (i) => {
     ]
   });
 
-  saveTicket(i.user.id, channel.id, type, { step: 1 });
-
-  flow.set(channel.id, {
+  db[channel.id] = {
+    userId: i.user.id,
+    type,
     step: type === "tryout" ? 1 : 99,
-    user: i.user.id,
-    data: { type }
-  });
+    data: {}
+  };
+
+  saveDB(db);
+
+  flow.set(channel.id, db[channel.id]);
 
   const embed = new EmbedBuilder()
     .setColor(COLOR)
     .setTitle("🎫 Ticket Opened")
-    .setDescription(
-      type === "tryout"
-        ? "Step 1: Send your Roblox username"
-        : "Explain your issue"
-    )
+    .setDescription(type === "tryout"
+      ? "Step 1: Send Roblox username"
+      : "Explain your issue")
     .setFooter({ text: "NAX System" })
     .setTimestamp();
 
@@ -196,23 +185,22 @@ client.on("interactionCreate", async (i) => {
 client.on("interactionCreate", async (i) => {
   if (!i.isButton()) return;
 
-  const guild = i.guild;
+  const db = loadDB();
 
-  // CLAIM
   if (i.customId === "claim") {
     if (claimed.has(i.channel.id)) {
-      return i.reply({ content: "❌ Already claimed.", ephemeral: true });
+      return i.reply({ content: "Already claimed", ephemeral: true });
     }
 
     claimed.set(i.channel.id, i.user.id);
     return i.reply(`📌 Claimed by <@${i.user.id}>`);
   }
 
-  // CLOSE + TRANSCRIPT
   if (i.customId === "close") {
-    const log = guild.channels.cache.get(LOG_CHANNEL);
+    const log = i.guild.channels.cache.get(LOG_CHANNEL);
 
     const msgs = await i.channel.messages.fetch({ limit: 100 });
+
     const transcript = msgs
       .map(m => `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}`)
       .reverse()
@@ -224,32 +212,33 @@ client.on("interactionCreate", async (i) => {
           new EmbedBuilder()
             .setTitle("📄 Ticket Closed")
             .setColor(COLOR)
-            .setDescription("Transcript attached below")
         ],
         files: [{
-          attachment: Buffer.from(transcript, "utf-8"),
+          attachment: Buffer.from(transcript, "utf8"),
           name: "transcript.txt"
         }]
       });
     }
 
+    delete db[i.channel.id];
+    saveDB(db);
+
     flow.delete(i.channel.id);
     claimed.delete(i.channel.id);
 
-    await i.reply("🔒 Closing ticket...");
+    await i.reply("Closing...");
     setTimeout(() => i.channel.delete(), 1500);
   }
 
-  // ACCEPT / REJECT
   if (i.customId === "accept" || i.customId === "reject") {
-    const member = await guild.members.fetch(i.message.mentions.users.first().id);
+    const member = await i.guild.members.fetch(i.message.mentions.users.first().id);
 
     if (i.customId === "accept") {
       await member.roles.add(NAX_ROLE);
-      member.send("✅ You were accepted into NAX");
+      member.send("✅ Accepted into NAX");
       i.channel.send("Accepted ✔");
     } else {
-      member.send("❌ You were rejected");
+      member.send("❌ Rejected");
       i.channel.send("Rejected ❌");
     }
   }
@@ -257,46 +246,42 @@ client.on("interactionCreate", async (i) => {
 
 // ===== TRYOUT FLOW =====
 client.on("messageCreate", async (m) => {
-  const state = flow.get(m.channel.id);
+  const db = loadDB();
+  const state = db[m.channel.id];
   if (!state) return;
 
-  // STEP 1: username
   if (state.step === 1) {
-    if (Date.now() - m.member.user.createdTimestamp < ms("3d")) {
-      return m.reply("❌ Account too new (3 day minimum)");
-    }
-
     state.data.username = m.content;
     state.step = 2;
 
     await m.channel.setName(`tryout-${m.content}`);
+    db[m.channel.id] = state;
+    saveDB(db);
 
-    return m.channel.send("Step 2: Send your Rivals screenshot");
+    return m.channel.send("Step 2: Send screenshot");
   }
 
-  // STEP 2: image
   if (state.step === 2) {
-    if (!m.attachments.size) return m.reply("❌ Screenshot required");
+    if (!m.attachments.size) return m.reply("Screenshot required");
 
     const img = m.attachments.first().url;
     state.data.image = img;
 
     const embed = new EmbedBuilder()
-      .setTitle("📊 NAX Application")
+      .setTitle("📊 Application")
       .setColor(COLOR)
       .addFields(
-        { name: "Username", value: state.data.username },
-        { name: "Type", value: "Tryout" },
-        { name: "Status", value: "Pending Review" }
+        { name: "Username", value: state.data.username }
       )
       .setImage(img)
-      .setFooter({ text: "NAX System" })
       .setTimestamp();
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("accept").setLabel("Accept").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId("reject").setLabel("Reject").setStyle(ButtonStyle.Danger)
     );
+
+    saveDB(db);
 
     return m.channel.send({ embeds: [embed], components: [row] });
   }
